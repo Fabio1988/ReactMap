@@ -86,6 +86,11 @@ const startServer = async () => {
           ],
           frameSrc: ["'self'", 'https://*.telegram.org'],
           workerSrc: ["'self'", 'blob:'],
+          connectSrc: [
+            "'self'", 
+            "https://web.telegram.org", 
+            "https://api.telegram.org",
+          ],
         },
       },
     }),
