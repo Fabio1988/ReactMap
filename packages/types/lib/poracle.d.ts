@@ -50,6 +50,7 @@ export interface PoracleGym {
   template: string
   team: number
   slot_changes: number
+  battle_changes?: boolean
   gym_id: string
   description: string
   description?: string

@@ -46,6 +46,7 @@ type PoracleGym {
   template: String
   team: Int
   slot_changes: Int
+  battle_changes: Boolean
   gym_id: String
   description: String
 }

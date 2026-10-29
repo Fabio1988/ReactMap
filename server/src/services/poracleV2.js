@@ -49,7 +49,8 @@ const ANY_ID = 9000
  * @typedef {{ kind: 'int', wc?: number, required?: boolean }
  *   | { kind: 'enum', values: readonly string[], wc: number, required?: boolean }
  *   | { kind: 'bool' }
- *   | { kind: 'string', empty: string | null }} FieldSpec
+ *   | { kind: 'string', empty: string | null }
+ *   | { kind: 'list' }} FieldSpec
  */
 
 /** @type {Record<string, FieldSpec>} */
@@ -57,6 +58,8 @@ const COMMON_FIELDS = {
   distance: { kind: 'int', wc: 0 },
   template: { kind: 'string', empty: '' },
   ping: { kind: 'string', empty: '' },
+  override_location_label: { kind: 'string', empty: '' },
+  override_areas: { kind: 'list' },
 }
 
 /** @type {Record<string, Record<string, FieldSpec>>} */
@@ -64,6 +67,7 @@ const FIELDS = {
   pokemon: {
     pokemon_id: { kind: 'int', required: true },
     form: { kind: 'int', wc: 0 },
+    costume: { kind: 'int', wc: ANY_ID },
     min_iv: { kind: 'int', wc: -1 },
     max_iv: { kind: 'int', wc: 100 },
     min_cp: { kind: 'int', wc: 0 },
@@ -89,10 +93,12 @@ const FIELDS = {
     pvp_ranking_worst: { kind: 'int', wc: 4096 },
     pvp_ranking_min_cp: { kind: 'int', wc: 0 },
     pvp_ranking_cap: { kind: 'int', wc: 0 },
+    pvp_ranking_evolution: { kind: 'int', wc: 0 },
   },
   // raid pokemon_id and level are derived from each other; see raidToV2.
   raid: {
     form: { kind: 'int', wc: 0 },
+    costume: { kind: 'int', wc: ANY_ID },
     move: { kind: 'int', wc: ANY_ID },
     evolution: { kind: 'int', wc: ANY_ID },
     team: { kind: 'enum', values: TEAMS, wc: 4 },
@@ -190,6 +196,9 @@ function copyToV2(row, specs, out) {
           out[field] = String(value)
         }
         break
+      case 'list':
+        if (Array.isArray(value) && value.length) out[field] = value.map(String)
+        break
       default:
     }
   })
@@ -220,6 +229,9 @@ function copyFromV2(rule, specs, out) {
         break
       case 'string':
         out[field] = value ?? spec.empty
+        break
+      case 'list':
+        out[field] = value ?? null
         break
       default:
     }
@@ -310,7 +322,9 @@ function toV2Rule(category, row) {
 function fromV2Rule(type, rule, owner) {
   /** @type {Record<string, any>} */
   const row = {
-    uid: rule.uid,
+    // Incident rules share ReactMap's invasion list but have their own uid
+    // sequence, so they are told apart by sign; see toV2Uid.
+    uid: type === 'incident' ? -rule.uid : rule.uid,
     id: owner.id,
     profile_no: owner.profile_no,
   }
@@ -335,6 +349,20 @@ function fromV2Rule(type, rule, owner) {
   row.clean =
     (rule.clean ? 1 : 0) + (rule.edit ? 2 : 0) + (rule.summary ? 4 : 0)
   return row
+}
+
+/**
+ * Resolves a ReactMap uid to the v2 type and uid it names. Under `invasion`,
+ * negative uids are incident rules (see fromV2Rule).
+ * @param {string} category
+ * @param {string | number} uid
+ * @returns {{ type: string, uid: number }}
+ */
+function toV2Uid(category, uid) {
+  const n = Number(uid)
+  return category === 'invasion' && n < 0
+    ? { type: 'incident', uid: -n }
+    : { type: category, uid: n }
 }
 
 /** @param {unknown} value */
@@ -377,6 +405,7 @@ module.exports = {
   EVENT_DISPLAY_TYPES,
   toV2Rule,
   fromV2Rule,
+  toV2Uid,
   toV2ActiveHours,
   fromV2ActiveHours,
 }

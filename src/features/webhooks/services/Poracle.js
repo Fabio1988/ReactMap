@@ -258,6 +258,7 @@ export class Poracle {
         return entries
           .map((pkmn) => {
             const fields = [
+              'uid',
               'pokemon_id',
               'form',
               'clean',

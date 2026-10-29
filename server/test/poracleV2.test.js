@@ -11,6 +11,11 @@ const {
   toV2ActiveHours,
   fromV2ActiveHours,
 } = require('../src/services/poracleV2')
+const {
+  keepHiddenFields,
+  mergeClean,
+  cleanBit,
+} = require('../src/services/poracleRules')
 
 const owner = { id: '123', profile_no: 1 }
 
@@ -145,6 +150,7 @@ test('invasion: pokestop events become incident rules', () => {
   })
 
   const event = fromV2Rule('incident', { uid: 4, display_type: 7 }, owner)
+  assert.equal(event.uid, -4)
   assert.equal(event.grunt_type, 'gold-stop')
   assert.equal(event.gender, 0)
 
@@ -246,7 +252,10 @@ const v2Spec = {
         'lure',
         'nest',
         'gym',
-      ].map((type) => `/v2/humans/{id}/tracking/${type}`),
+      ].flatMap((type) => [
+        `/v2/humans/{id}/tracking/${type}`,
+        `/v2/humans/{id}/tracking/${type}/{uid}`,
+      ]),
     ].map((p) => [p, {}]),
   ),
 }
@@ -284,7 +293,7 @@ test('auto detects v2 from the OpenAPI spec, v1 without one', async () => {
   }
 })
 
-test('v2 tracking POST splits invasion and incident, then lists both', async () => {
+test('v2 tracking POST replaces edits by uid, splits invasion and incident', async () => {
   const stub = await stubPoracle({
     spec: v2Spec,
     routes: {
@@ -304,22 +313,24 @@ test('v2 tracking POST splits invasion and incident, then lists both', async () 
       { grunt_type: 'showcase', gender: 0, clean: true },
     ])
 
-    const posts = stub.requests.filter((r) => r.method === 'POST')
-    assert.deepEqual(posts.map((r) => [r.url, r.body]).sort(), [
+    const writes = stub.requests.filter((r) => r.method !== 'GET')
+    assert.deepEqual(writes.map((r) => [r.method, r.url, r.body]).sort(), [
       [
+        'POST',
         '/api/v2/humans/123/tracking/incident',
         [{ display_type: 9, clean: true }],
       ],
       [
-        '/api/v2/humans/123/tracking/invasion',
-        [{ grunt_type: 'water', gender: 'female' }],
+        'PUT',
+        '/api/v2/humans/123/tracking/invasion/1',
+        { grunt_type: 'water', gender: 'female' },
       ],
     ])
     assert.deepEqual(
       result.invasion.map((r) => [r.uid, r.grunt_type, r.gender, r.profile_no]),
       [
         [1, 'water', 2, 2],
-        [2, 'showcase', 0, 2],
+        [-2, 'showcase', 0, 2],
       ],
     )
   } finally {
@@ -327,15 +338,15 @@ test('v2 tracking POST splits invasion and incident, then lists both', async () 
   }
 })
 
-test('v2 bulk delete hits both invasion endpoints without a body', async () => {
+test('v2 bulk delete routes invasion uids by sign, without a body', async () => {
   const stub = await stubPoracle({ spec: v2Spec })
   try {
     const api = await initApi(stub.port, 'v2-delete')
-    await api.api('123', 'invasion-delete', 'POST', ['4', '5'])
+    await api.api('123', 'invasion-delete', 'POST', ['4', '-5', '6'])
     const deletes = stub.requests.filter((r) => r.method === 'DELETE')
     assert.deepEqual(deletes.map((r) => r.url).sort(), [
-      '/api/v2/humans/123/tracking/incident?uid=4,5',
-      '/api/v2/humans/123/tracking/invasion?uid=4,5',
+      '/api/v2/humans/123/tracking/incident?uid=5',
+      '/api/v2/humans/123/tracking/invasion?uid=4,6',
     ])
     assert.ok(deletes.every((r) => r.body === undefined))
   } finally {
@@ -404,5 +415,152 @@ test('a cached v2 result does not override a configured apiVersion', () => {
     assert.equal(auto.v2, true)
   } finally {
     fs.rmSync(file, { force: true })
+  }
+})
+
+test('clean checkbox keeps the stored edit and summary bits', () => {
+  assert.equal(mergeClean(3, false), 2)
+  assert.equal(mergeClean(2, true), 3)
+  assert.equal(mergeClean(6, 1), 7)
+  assert.equal(mergeClean(5, undefined), 5)
+  assert.equal(mergeClean(0, true), 1)
+  // A full bitmask from the client is taken as is.
+  assert.equal(mergeClean(1, 6), 6)
+
+  assert.equal(cleanBit({ clean: 2 }), false)
+  assert.equal(cleanBit({ clean: 3 }), true)
+  assert.equal(cleanBit({ clean: true }), true)
+})
+
+test('an edit keeps the settings ReactMap has no input for', () => {
+  const stored = {
+    uid: 7,
+    pokemon_id: 25,
+    costume: 4,
+    pvp_ranking_league: 1500,
+    pvp_ranking_evolution: 1,
+    override_areas: ['town'],
+    override_location_label: '',
+    clean: 2,
+  }
+  assert.deepEqual(
+    keepHiddenFields('pokemon', stored, {
+      uid: 7,
+      pokemon_id: 25,
+      pvp_ranking_league: 1500,
+      distance: 0,
+      clean: true,
+    }),
+    {
+      uid: 7,
+      pokemon_id: 25,
+      pvp_ranking_league: 1500,
+      distance: 0,
+      clean: 3,
+      costume: 4,
+      pvp_ranking_evolution: 1,
+      override_areas: ['town'],
+    },
+  )
+
+  // Switched to an IV rule with a distance: the PVP evolution and the area
+  // override no longer apply.
+  const ivRule = keepHiddenFields('pokemon', stored, {
+    uid: 7,
+    pokemon_id: 25,
+    pvp_ranking_league: 0,
+    distance: 500,
+    clean: false,
+  })
+  assert.equal(ivRule.pvp_ranking_evolution, undefined)
+  assert.equal(ivRule.override_areas, undefined)
+  assert.equal(ivRule.costume, 4)
+  assert.equal(ivRule.clean, 2)
+
+  const located = keepHiddenFields(
+    'raid',
+    { uid: 1, override_location_label: 'work', evolution: 1, pokemon_id: 150 },
+    { uid: 1, pokemon_id: 150, distance: 1000 },
+  )
+  assert.equal(located.override_location_label, 'work')
+  assert.equal(located.evolution, 1)
+
+  const gym = keepHiddenFields(
+    'gym',
+    { uid: 2, battle_changes: 1 },
+    { uid: 2, team: 4 },
+  )
+  assert.equal(gym.battle_changes, 1)
+})
+
+test('costume, pvp evolution and overrides round-trip through v2', () => {
+  const row = fromV2Rule(
+    'pokemon',
+    {
+      uid: 1,
+      pokemon_id: 25,
+      costume: 4,
+      pvp_ranking_league: 1500,
+      pvp_ranking_evolution: 1,
+      override_areas: ['town'],
+      override_location_label: null,
+    },
+    owner,
+  )
+  assert.equal(row.costume, 4)
+  assert.equal(row.pvp_ranking_evolution, 1)
+  assert.deepEqual(row.override_areas, ['town'])
+  assert.equal(row.override_location_label, '')
+
+  const { rule } = toV2Rule('pokemon', row)
+  assert.equal(rule.costume, 4)
+  assert.equal(rule.pvp_ranking_evolution, 1)
+  assert.deepEqual(rule.override_areas, ['town'])
+  assert.equal('override_location_label' in rule, false)
+
+  const any = fromV2Rule('raid', { uid: 2, pokemon_id: 150 }, owner)
+  assert.equal(any.costume, 9000)
+  assert.equal('costume' in toV2Rule('raid', any).rule, false)
+})
+
+test('v1 edits are sent with the stored hidden settings', async () => {
+  const stub = await stubPoracle({
+    routes: {
+      'GET /api/tracking/pokemon/123': {
+        status: 'ok',
+        pokemon: [
+          {
+            uid: 7,
+            pokemon_id: 25,
+            costume: 4,
+            override_areas: ['town'],
+            clean: 2,
+          },
+        ],
+      },
+    },
+  })
+  try {
+    const api = await initApi(stub.port, 'v1-hidden')
+    await api.api('123', 'pokemon', 'POST', [
+      { uid: 7, pokemon_id: 25, min_iv: 90, distance: 0, clean: false },
+      { pokemon_id: 1, distance: 0, clean: true },
+    ])
+    const post = stub.requests.find((r) => r.method === 'POST')
+    assert.equal(post.url, '/api/tracking/pokemon/123')
+    assert.deepEqual(post.body, [
+      {
+        uid: 7,
+        pokemon_id: 25,
+        min_iv: 90,
+        distance: 0,
+        clean: 2,
+        costume: 4,
+        override_areas: ['town'],
+      },
+      { pokemon_id: 1, distance: 0, clean: true },
+    ])
+  } finally {
+    await stub.close()
   }
 })

@@ -13,6 +13,7 @@ const { filterComponents } = require('../utils/filterComponents')
 const { annotateTelegramBlocks } = require('../utils/getTelegramStrategy')
 const { validateSelectedWebhook } = require('../utils/validateSelectedWebhook')
 const { PoracleAPI } = require('../services/Poracle')
+const { cleanBit } = require('../services/poracleRules')
 const { geocoder } = require('../services/geocoder')
 const { scannerApi } = require('../services/scannerApi')
 const {
@@ -30,6 +31,21 @@ const {
 /** @type {import("@apollo/server").ApolloServerOptions<import("@rm/types").GqlContext>['resolvers']} */
 const resolvers = {
   JSON: GraphQLJSON,
+  // Poracle's `clean` packs clean/edit/summary bits; the checkbox is the
+  // clean bit only (edits keep the others, see poracleRules).
+  ...Object.fromEntries(
+    [
+      'PoracleEgg',
+      'PoracleGym',
+      'PoracleInvasion',
+      'PoracleLure',
+      'PoracleNest',
+      'PoraclePokemon',
+      'PoracleQuest',
+      'PoracleRaid',
+      'PoracleWeather',
+    ].map((type) => [type, { clean: cleanBit }]),
+  ),
   Query: {
     available: (_, _args, { Event, Db, perms }) => {
       const supportsShinyStats = Array.isArray(Db.models?.Pokemon)

@@ -64,6 +64,7 @@ const Gym = gql`
       ping
       profile_no
       slot_changes
+      battle_changes
       team
       template
       uid

@@ -8,9 +8,11 @@ const { setCache, getCache } = require('./cache')
 const {
   toV2Rule,
   fromV2Rule,
+  toV2Uid,
   toV2ActiveHours,
   fromV2ActiveHours,
 } = require('./poracleV2')
+const { keepHiddenFieldsAll } = require('./poracleRules')
 
 const PLATFORMS = /** @type {const} */ (['discord', 'telegram'])
 
@@ -78,7 +80,10 @@ const V2_REQUIRED_PATHS = [
     'lure',
     'nest',
     'gym',
-  ].map((type) => `/v2/humans/{id}/tracking/${type}`),
+  ].flatMap((type) => [
+    `/v2/humans/{id}/tracking/${type}`,
+    `/v2/humans/{id}/tracking/${type}/{uid}`,
+  ]),
 ]
 
 const SUBCATEGORIES = /** @type {const} */ ({
@@ -589,9 +594,29 @@ class PoracleAPI {
     return { ...first, ...second }
   }
 
+  /**
+   * Edits (rows with a uid) carry only the fields ReactMap shows; copy the
+   * rest over from the stored rules so the update does not reset them.
+   * @param {string | number} userId
+   * @param {string} category
+   * @param {any} data
+   */
+  async #keepHiddenFields(userId, category, data) {
+    const rows = Array.isArray(data) ? data : [data]
+    if (!rows.some((row) => row?.uid)) return data
+    const stored = this.v2
+      ? (await this.#listV2(userId, category))[category]
+      : (await this.#sendRequest(APIS.tracking(userId, category)))?.[category]
+    const merged = keepHiddenFieldsAll(category, stored || [], rows)
+    return Array.isArray(data) ? merged : merged[0]
+  }
+
   /** @type {PoracleAPI['api']} */
   async #tracking(userId, category, method, data) {
     const [main, action] = PoracleAPI.#split(category)
+    if (!action && method === 'POST') {
+      data = await this.#keepHiddenFields(userId, main, data)
+    }
     const first = action
       ? await this.#sendRequest(
           APIS.tracking(userId, main, action),
@@ -822,17 +847,22 @@ class PoracleAPI {
   }
 
   /**
-   * Bulk-deletes by uid. For invasion the uids may be invasion or incident
-   * rules; each endpoint skips uids that belong to the other type.
+   * Bulk-deletes by uid. Under invasion, negative uids are incident rules.
    * @param {string | number} userId
    * @param {string} category
    * @param {Array<string | number>} uids
    */
   async #deleteV2(userId, category, uids) {
-    const list = uids.map(Number).filter(Number.isInteger)
-    if (!list.length) return
+    /** @type {Record<string, number[]>} */
+    const byType = {}
+    uids
+      .filter((uid) => Number.isInteger(Number(uid)) && Number(uid) !== 0)
+      .forEach((value) => {
+        const { type, uid } = toV2Uid(category, value)
+        ;(byType[type] ||= []).push(uid)
+      })
     await Promise.all(
-      PoracleAPI.#v2Types(category).map((type) =>
+      Object.entries(byType).map(([type, list]) =>
         this.#sendV2(
           `${V2.tracking(userId, type)}?uid=${list.join(',')}`,
           'DELETE',
@@ -842,7 +872,8 @@ class PoracleAPI {
   }
 
   /**
-   * Posts v1-shaped rows as v2 rules, grouped by the v2 type each maps to.
+   * Saves v1-shaped rows as v2 rules: new ones are posted, grouped by the v2
+   * type each maps to, and edits (rows with a uid) are replaced by uid.
    * @param {string | number} userId
    * @param {string} category
    * @param {Record<string, any>[]} rows
@@ -850,15 +881,32 @@ class PoracleAPI {
   async #createV2(userId, category, rows) {
     /** @type {Record<string, Record<string, any>[]>} */
     const byType = {}
+    /** @type {Promise<any>[]} */
+    const edits = []
     rows.forEach((row) => {
       const { type, rule } = toV2Rule(category, row)
-      ;(byType[type] ||= []).push(rule)
+      if (!row.uid) {
+        ;(byType[type] ||= []).push(rule)
+        return
+      }
+      // An edit replaces the rule in place, keeping its uid. One that turns an
+      // invasion into a pokestop event (or back) moves it to the other type.
+      const stored = toV2Uid(category, row.uid)
+      const path = `${V2.tracking(userId, stored.type)}/${stored.uid}`
+      edits.push(
+        stored.type === type
+          ? this.#sendV2(path, 'PUT', rule)
+          : this.#sendV2(path, 'DELETE').then(() =>
+              this.#sendV2(V2.tracking(userId, type), 'POST', [rule]),
+            ),
+      )
     })
-    await Promise.all(
-      Object.entries(byType).map(([type, rules]) =>
+    await Promise.all([
+      ...edits,
+      ...Object.entries(byType).map(([type, rules]) =>
         this.#sendV2(V2.tracking(userId, type), 'POST', rules),
       ),
-    )
+    ])
   }
 
   /**
@@ -874,10 +922,11 @@ class PoracleAPI {
     } else if (method === 'DELETE') {
       await this.#deleteV2(userId, category, [data.uid])
     } else if (method === 'POST') {
+      const rows = await this.#keepHiddenFields(userId, category, data)
       await this.#createV2(
         userId,
         category,
-        Array.isArray(data) ? data : [data],
+        Array.isArray(rows) ? rows : [rows],
       )
     }
     return this.#listV2(userId, category)
