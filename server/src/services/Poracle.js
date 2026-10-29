@@ -1,8 +1,16 @@
 // @ts-check
 
+const { default: fetch } = require('node-fetch')
+
 const { log, TAGS } = require('@rm/logger')
 const { fetchJson } = require('../utils/fetchJson')
 const { setCache, getCache } = require('./cache')
+const {
+  toV2Rule,
+  fromV2Rule,
+  toV2ActiveHours,
+  fromV2ActiveHours,
+} = require('./poracleV2')
 
 const PLATFORMS = /** @type {const} */ (['discord', 'telegram'])
 
@@ -36,6 +44,42 @@ const APIS = /** @type {APIReference} */ ({
       suffix ? `/${suffix}` : ''
     }`,
 })
+
+/** PoracleNG v2 routes, used when the server supports them. */
+const V2 = {
+  human: (userId) => `/api/v2/humans/${userId}`,
+  action: (userId, action) => `/api/v2/humans/${userId}/${action}`,
+  tracking: (userId, type) => `/api/v2/humans/${userId}/tracking/${type}`,
+  profiles: (userId, suffix) =>
+    `/api/v2/humans/${userId}/profiles${suffix ? `/${suffix}` : ''}`,
+}
+
+/**
+ * OpenAPI paths (relative to the spec's `/api` server) that the v2 code path
+ * relies on. `auto` only switches to v2 when all of them are served.
+ */
+const V2_REQUIRED_PATHS = [
+  '/v2/humans/{id}',
+  '/v2/humans/{id}/areas',
+  '/v2/humans/{id}/enable',
+  '/v2/humans/{id}/disable',
+  '/v2/humans/{id}/location',
+  '/v2/humans/{id}/profile',
+  '/v2/humans/{id}/profiles',
+  '/v2/humans/{id}/profiles/{profile_no}',
+  '/v2/humans/{id}/profiles/{profile_no}/copy',
+  ...[
+    'pokemon',
+    'raid',
+    'egg',
+    'quest',
+    'invasion',
+    'incident',
+    'lure',
+    'nest',
+    'gym',
+  ].map((type) => `/v2/humans/{id}/tracking/${type}`),
+]
 
 const SUBCATEGORIES = /** @type {const} */ ({
   gym: ['raid', 'egg', 'gym'],
@@ -91,6 +135,9 @@ class PoracleAPI {
     this.nominatimUrl = webhook.nominatimUrl
     this.geocoderProvider = webhook.geocoderProvider
     this.enabled = webhook.enabled || false
+    this.apiVersion = webhook.apiVersion || 'auto'
+    /** Whether requests go to the PoracleNG v2 API, resolved during init */
+    this.v2 = this.apiVersion === 'v2'
 
     this.discordRoles = webhook.discordRoles || []
     this.telegramGroups = webhook.telegramGroups || []
@@ -179,7 +226,9 @@ class PoracleAPI {
    */
   async getUserAreas(userId) {
     /** @type {{ areas: import("@rm/types").PoracleHumanArea[] }} */
-    const { areas } = await this.#sendRequest(APIS.humans(userId))
+    const { areas } = await this.#sendRequest(
+      this.v2 ? V2.action(userId, 'areas') : APIS.humans(userId),
+    )
     const areaGroups = areas.reduce((groupMap, area) => {
       if (area.userSelectable) {
         if (!groupMap[area.group]) groupMap[area.group] = []
@@ -224,7 +273,12 @@ class PoracleAPI {
       log.warn(TAGS.webhooks, `${this.name} webhook not found in cache`)
       return false
     }
+    // The configured apiVersion wins over a cached one; a cached `auto`
+    // result is only reused while the config still says `auto`.
+    const { apiVersion } = this
     Object.assign(this, cached)
+    this.apiVersion = apiVersion
+    if (apiVersion !== 'auto') this.v2 = apiVersion === 'v2'
   }
 
   async init() {
@@ -233,6 +287,7 @@ class PoracleAPI {
         this.#fetchConfig(),
         this.#fetchGeojson(),
         this.#fetchTemplates(),
+        this.#detectApiVersion(),
       ])
       this.ui = this.generateUi()
       this.lastFetched = Date.now()
@@ -299,6 +354,34 @@ class PoracleAPI {
     }
   }
 
+  /**
+   * Resolves `apiVersion: 'auto'` by checking the server's public OpenAPI spec
+   * for the v2 routes this service uses. PoracleJS has no spec, so it stays on
+   * v1; the probe is quiet because that miss is expected.
+   */
+  async #detectApiVersion() {
+    if (this.apiVersion !== 'auto') {
+      this.v2 = this.apiVersion === 'v2'
+      return
+    }
+    try {
+      const response = await fetch(`${this.endpoint}/openapi.json`, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(10_000),
+      })
+      const spec = response.ok ? await response.json() : null
+      const paths = spec?.paths || {}
+      this.v2 = V2_REQUIRED_PATHS.every((path) => path in paths)
+    } catch (e) {
+      log.debug(TAGS.webhooks, `[${this.name}] v2 API probe failed`, e)
+      this.v2 = false
+    }
+    log.info(
+      TAGS.webhooks,
+      `[${this.name}] using Poracle API ${this.v2 ? 'v2' : 'v1'}`,
+    )
+  }
+
   async #fetchGeojson() {
     /** @type {{ geoJSON: import("@rm/types").RMGeoJSON }} */
     const { geoJSON } = await this.#sendRequest(APIS.geofence)
@@ -346,27 +429,54 @@ class PoracleAPI {
   }
 
   /**
+   * Like #sendRequest, but only sends a body when one is given: v2 is strict
+   * about bodies (bulk DELETE takes `?uid=` or a body, not both).
+   * @param {string} path
+   * @param {Method} [method]
+   * @param {any} [body]
+   */
+  async #sendV2(path, method = 'GET', body = undefined) {
+    return fetchJson(`${this.endpoint}${path}`, {
+      method,
+      headers: {
+        'X-Poracle-Secret': this.secret,
+        Accept: 'application/json',
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+  }
+
+  /**
+   * v1 returns the list columns as JSON-encoded strings, v2 as arrays.
+   * @param {string | string[] | null | undefined} value
+   * @returns {string[]}
+   */
+  static #parseList(value) {
+    if (!value) return []
+    return typeof value === 'string' ? JSON.parse(value) : value
+  }
+
+  /**
    *
    * @param {string | number} userId
    * @returns
    */
   async #oneHuman(userId) {
-    const { human } = await this.#sendRequest(APIS.oneHuman(userId))
+    const { human } = this.v2
+      ? await this.#sendV2(V2.human(userId))
+      : await this.#sendRequest(APIS.oneHuman(userId))
     return {
       human: {
         ...human,
         enabled: !!human.enabled,
         admin_disable: !!human.admin_disable,
-        area: human.area ? JSON.parse(human.area) : [],
-        area_restrictions: human.area_restrictions
-          ? JSON.parse(human.area_restrictions)
-          : [],
-        blocked_alerts: human.blocked_alerts
-          ? JSON.parse(human.blocked_alerts)
-          : [],
-        community_membership: human.community_membership
-          ? JSON.parse(human.community_membership)
-          : [],
+        area: PoracleAPI.#parseList(human.area),
+        area_restrictions: PoracleAPI.#parseList(
+          this.v2 ? human.area_restriction : human.area_restrictions,
+        ),
+        blocked_alerts: PoracleAPI.#parseList(human.blocked_alerts),
+        community_membership: PoracleAPI.#parseList(human.community_membership),
       },
     }
   }
@@ -435,11 +545,13 @@ class PoracleAPI {
   static #processProfiles(profiles) {
     return profiles.map((profile) => ({
       ...profile,
-      area: profile.area ? JSON.parse(profile.area) : [],
+      area: PoracleAPI.#parseList(profile.area),
       active_hours:
         profile.active_hours && profile.active_hours !== '{}'
           ? /** @type {import("@rm/types").PoracleActiveHours[]} */ (
-              JSON.parse(profile.active_hours)
+              typeof profile.active_hours === 'string'
+                ? JSON.parse(profile.active_hours)
+                : profile.active_hours
             )
               .sort((a, b) =>
                 a.day === b.day
@@ -514,6 +626,7 @@ class PoracleAPI {
    * @returns {Promise<import("@rm/types").APIReturnType[import("@rm/types").Split<T, '-'>[0]]>}
    */
   async api(userId, category, method = 'GET', data = null) {
+    if (this.v2) return this.#apiV2(userId, category, method, data)
     const [main, action] = PoracleAPI.#split(category)
     switch (main) {
       case 'start':
@@ -576,6 +689,217 @@ class PoracleAPI {
       ),
     )
     return this.#sendRequest(APIS.tracking(userId, 'gym'))
+  }
+
+  /**
+   * v2 counterpart of api(): same categories, same v1-shaped results.
+   * @param {string | number} userId
+   * @param {APIInput} category
+   * @param {Method} method
+   * @param {any} data
+   * @returns {Promise<any>}
+   */
+  async #apiV2(userId, category, method = 'GET', data = null) {
+    const [main, action] = PoracleAPI.#split(category)
+    switch (main) {
+      case 'start':
+      case 'stop':
+        await this.#sendV2(
+          V2.action(userId, main === 'start' ? 'enable' : 'disable'),
+          'POST',
+        )
+        return this.#oneHuman(userId)
+      case 'switchProfile':
+        await this.#sendV2(V2.action(userId, 'profile'), 'POST', {
+          profile_no: +data,
+        })
+        return this.#oneHuman(userId)
+      case 'setLocation':
+        await this.#sendV2(V2.action(userId, 'location'), 'POST', {
+          latitude: +data[0],
+          longitude: +data[1],
+        })
+        return this.#oneHuman(userId)
+      case 'setAreas': {
+        const first = await this.#sendV2(V2.action(userId, 'areas'), 'POST', {
+          areas: data,
+        })
+        return { ...first, ...(await this.#oneHuman(userId)) }
+      }
+      case 'geojson':
+        return this.#sendRequest(APIS.geofence)
+      case 'areaSecurity':
+        return this.#sendRequest(APIS.areaSecurity(userId))
+      case 'humans':
+        return this.#sendV2(V2.action(userId, 'areas'))
+      case 'profile':
+      case 'profiles':
+        return this.#profileManagementV2(userId, action, method, data)
+      case 'quickGym':
+        return this.#quickGymV2(userId, data)
+      case 'human':
+      case 'oneHuman':
+        return this.#oneHuman(userId)
+      default:
+        return this.#trackingV2(userId, main, action, method, data)
+    }
+  }
+
+  /**
+   * @param {string | number} userId
+   * @param {Action | undefined} action
+   * @param {Method} method
+   * @param {any} data
+   */
+  async #profileManagementV2(userId, action, method, data) {
+    switch (action) {
+      case 'add':
+        await this.#sendV2(V2.profiles(userId), 'POST', {
+          name: data.name,
+          ...(data.active_hours?.length
+            ? { active_hours: toV2ActiveHours(data.active_hours) }
+            : {}),
+        })
+        break
+      case 'update':
+        // v1's update only ever wrote active_hours; keep it that way.
+        await this.#sendV2(V2.profiles(userId, data.profile_no), 'PATCH', {
+          active_hours: toV2ActiveHours(data.active_hours),
+        })
+        break
+      case 'byProfileNo':
+        if (method === 'DELETE') {
+          await this.#sendV2(V2.profiles(userId, data), 'DELETE')
+        }
+        break
+      case 'copy':
+        await this.#sendV2(V2.profiles(userId, `${data.to}/copy`), 'POST', {
+          from_profile: +data.from,
+        })
+        break
+      default:
+    }
+    const { profiles } = await this.#sendV2(V2.profiles(userId))
+    return {
+      profile: PoracleAPI.#processProfiles(
+        (profiles || []).map((profile) => ({
+          ...profile,
+          active_hours: fromV2ActiveHours(profile.active_hours),
+        })),
+      ),
+    }
+  }
+
+  /**
+   * v2 serves pokestop events (gold-stop, kecleon, showcase) as `incident`,
+   * while ReactMap keeps them under `invasion`.
+   * @param {string} category
+   */
+  static #v2Types(category) {
+    return category === 'invasion' ? ['invasion', 'incident'] : [category]
+  }
+
+  /**
+   * Reads one category's rules in the v1 row shape.
+   * @param {string | number} userId
+   * @param {string} category
+   */
+  async #listV2(userId, category) {
+    const types = PoracleAPI.#v2Types(category)
+    const [{ human } = {}, ...lists] = await Promise.all([
+      this.#sendV2(V2.human(userId)),
+      ...types.map((type) =>
+        this.#sendV2(`${V2.tracking(userId, type)}?include_descriptions=true`),
+      ),
+    ])
+    const owner = { id: userId, profile_no: human?.current_profile_no }
+    const rows = lists.flatMap((list, i) =>
+      (list?.rules || []).map((rule) => fromV2Rule(types[i], rule, owner)),
+    )
+    const sortBy = this.ui[category]?.sortProp
+    if (sortBy) rows.sort((a, b) => a[sortBy] - b[sortBy])
+    return { status: 'ok', [category]: rows }
+  }
+
+  /**
+   * Bulk-deletes by uid. For invasion the uids may be invasion or incident
+   * rules; each endpoint skips uids that belong to the other type.
+   * @param {string | number} userId
+   * @param {string} category
+   * @param {Array<string | number>} uids
+   */
+  async #deleteV2(userId, category, uids) {
+    const list = uids.map(Number).filter(Number.isInteger)
+    if (!list.length) return
+    await Promise.all(
+      PoracleAPI.#v2Types(category).map((type) =>
+        this.#sendV2(
+          `${V2.tracking(userId, type)}?uid=${list.join(',')}`,
+          'DELETE',
+        ),
+      ),
+    )
+  }
+
+  /**
+   * Posts v1-shaped rows as v2 rules, grouped by the v2 type each maps to.
+   * @param {string | number} userId
+   * @param {string} category
+   * @param {Record<string, any>[]} rows
+   */
+  async #createV2(userId, category, rows) {
+    /** @type {Record<string, Record<string, any>[]>} */
+    const byType = {}
+    rows.forEach((row) => {
+      const { type, rule } = toV2Rule(category, row)
+      ;(byType[type] ||= []).push(rule)
+    })
+    await Promise.all(
+      Object.entries(byType).map(([type, rules]) =>
+        this.#sendV2(V2.tracking(userId, type), 'POST', rules),
+      ),
+    )
+  }
+
+  /**
+   * @param {string | number} userId
+   * @param {string} category
+   * @param {Action | undefined} action
+   * @param {Method} method
+   * @param {any} data
+   */
+  async #trackingV2(userId, category, action, method, data) {
+    if (action === 'delete') {
+      await this.#deleteV2(userId, category, data || [])
+    } else if (method === 'DELETE') {
+      await this.#deleteV2(userId, category, [data.uid])
+    } else if (method === 'POST') {
+      await this.#createV2(
+        userId,
+        category,
+        Array.isArray(data) ? data : [data],
+      )
+    }
+    return this.#listV2(userId, category)
+  }
+
+  /**
+   * @param {string | number} userId
+   * @param {string} data gym id
+   */
+  async #quickGymV2(userId, data) {
+    await Promise.all(
+      SUBCATEGORIES.gym.map((subCategory) =>
+        this.#createV2(userId, subCategory, [
+          {
+            ...this.ui[subCategory].defaults,
+            ...this.#wildCards(subCategory),
+            gym_id: data,
+          },
+        ]),
+      ),
+    )
+    return this.#listV2(userId, 'gym')
   }
 
   /**
