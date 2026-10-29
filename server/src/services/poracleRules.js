@@ -11,7 +11,6 @@
 const HIDDEN_FIELDS = /** @type {Record<string, string[]>} */ ({
   pokemon: ['costume', 'pvp_ranking_evolution'],
   raid: ['costume', 'evolution'],
-  gym: ['battle_changes'],
 })
 
 /**

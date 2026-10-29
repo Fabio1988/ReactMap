@@ -484,13 +484,6 @@ test('an edit keeps the settings ReactMap has no input for', () => {
   )
   assert.equal(located.override_location_label, 'work')
   assert.equal(located.evolution, 1)
-
-  const gym = keepHiddenFields(
-    'gym',
-    { uid: 2, battle_changes: 1 },
-    { uid: 2, team: 4 },
-  )
-  assert.equal(gym.battle_changes, 1)
 })
 
 test('costume, pvp evolution and overrides round-trip through v2', () => {
