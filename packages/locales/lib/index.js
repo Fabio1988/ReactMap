@@ -1,4 +1,7 @@
 // @ts-check
+// Consumers such as vite.config.js rely on `.env` being loaded here
+// (e.g. NODE_CONFIG_ENV selects the dist-* output dir), so keep this
+require('dotenv').config()
 
 const { create } = require('./create')
 const { missing } = require('./missing')
