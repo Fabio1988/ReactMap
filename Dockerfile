@@ -33,6 +33,9 @@ RUN --mount=type=cache,target=/usr/local/share/.cache/yarn \
 
 # ---- runtime ----
 FROM ${NODE_IMAGE}
+# Kept for parity with previous images (global npm installs in derived images)
+ENV NPM_CONFIG_PREFIX=/home/node/.npm-global
+ENV PATH=$PATH:/home/node/.npm-global/bin
 WORKDIR /home/node
 COPY --from=prune /home/node /home/node
 

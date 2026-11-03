@@ -93,6 +93,14 @@ const viteConfig = defineConfig(({ mode }) => {
               org: sentry.org,
               project: sentry.project,
               authToken: sentry.authToken,
+              // Docker images have no git, so fall back to the baked GIT_SHA
+              // (the plugin would otherwise run `git rev-parse HEAD`)
+              release: {
+                name:
+                  process.env.SENTRY_RELEASE ||
+                  process.env.GIT_SHA ||
+                  undefined,
+              },
             }),
           ]
         : []),

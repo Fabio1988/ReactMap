@@ -40,5 +40,7 @@ jobs:
           build-args: |
             GIT_SHA=${{ github.sha }}
             GIT_REF=${{ github.ref }}
+          # keep publishing a single image manifest like before (no attestation index)
+          provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
