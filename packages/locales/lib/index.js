@@ -2,7 +2,6 @@
 
 const { create } = require('./create')
 const { missing } = require('./missing')
-const { generate } = require('./generate')
 const {
   readLocaleDirectory,
   writeAll,
@@ -17,6 +16,5 @@ module.exports.locales = locales
 module.exports.status = status
 module.exports.create = create
 module.exports.missing = missing
-module.exports.generate = generate
 module.exports.writeAll = writeAll
 module.exports.readAndParseJson = readAndParseJson

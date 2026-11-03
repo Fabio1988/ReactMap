@@ -4,7 +4,6 @@
 
 const { defineConfig, loadEnv, createLogger } = require('vite')
 const { default: react } = require('@vitejs/plugin-react-swc')
-const { default: checker } = require('vite-plugin-checker')
 const removeFiles = require('rollup-plugin-delete')
 const { resolve } = require('path')
 const fs = require('fs')
@@ -74,7 +73,7 @@ const viteConfig = defineConfig(({ mode }) => {
       react(),
       ...(isDevelopment
         ? [
-            checker({
+            require('vite-plugin-checker').default({
               overlay: {
                 initialIsOpen: false,
               },
