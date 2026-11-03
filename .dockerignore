@@ -1,17 +1,24 @@
-# Only exclude things that are never runtime input. Local configs, custom
-# files, caches and .env are intentionally NOT excluded, so local
-# `docker build`s keep baking them in exactly like before.
-
 # VCS / CI
 .git
 .github
 .husky
 
-# Dependencies & build output (both are rebuilt inside the image)
+# Dependencies & build output (rebuilt inside the image)
 node_modules
 **/node_modules
 dist
 dist-*
+
+# Local runtime state & secrets (mount these instead)
+.env
+config/local.json
+config/areas.json
+server/src/configs/**
+!server/src/configs/.gitkeep
+server/.cache/**
+!server/.cache/.gitkeep
+logs/**
+!logs/.gitkeep
 .eslintcache
 
 # Docs & editor files
